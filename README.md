@@ -18,6 +18,7 @@ Default mode is `websocket` long connection, which does not require a public cal
 - Sends the result back to the same Feishu chat
 - Keeps one active Codex session per Feishu chat by default
 - Supports `/codex new`, `/codex resume`, and `/codex sessions`
+- Supports `/codex history` for recent prompt history in the active thread
 - Supports unattended operation on macOS via LaunchAgent
 
 ## Current scope
@@ -207,6 +208,7 @@ Basic health checks:
 /codex status
 /codex help
 /codex sessions
+/codex history
 ```
 
 Task request:
@@ -240,7 +242,7 @@ Commands:
 /codex sessions
 ```
 
-List recent sessions tracked for the current Feishu chat.
+List recent sessions tracked for the current Feishu chat. In Feishu, this is sent as an interactive card when possible, with text fallback if card delivery fails.
 
 ```text
 /codex new
@@ -274,6 +276,18 @@ Continue the previous investigation and restart the service if needed.
 ```
 
 Switch the active session and send a new prompt in one message.
+
+```text
+/codex history
+```
+
+Show the recent prompts recorded for the active session in this chat.
+
+```text
+/codex history 2 6
+```
+
+Show up to 6 recent prompts for session item 2 from `/codex sessions`.
 
 Notes:
 

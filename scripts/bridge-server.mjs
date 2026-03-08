@@ -194,7 +194,11 @@ async function handleMessage(context) {
     return;
   }
   if (parsed.kind === "sessions") {
-    await replyText(context.chatId, formatSessions(context.chatId));
+    await replySessions(context.chatId);
+    return;
+  }
+  if (parsed.kind === "history") {
+    await replyText(context.chatId, formatHistory(context.chatId, parsed.selection, parsed.limit));
     return;
   }
   if (parsed.kind === "new" && !parsed.body) {
@@ -203,7 +207,7 @@ async function handleMessage(context) {
     return;
   }
   if (parsed.kind === "resume" && !parsed.selection && !parsed.body) {
-    await replyText(context.chatId, formatSessions(context.chatId));
+    await replySessions(context.chatId);
     return;
   }
   if (parsed.kind === "resume" && parsed.selection && !parsed.body) {
@@ -247,6 +251,7 @@ async function handleMessage(context) {
         cwd: executionPlan.cwd,
         title: resolveSessionTitle(sessionId, executionPlan.prompt),
         lastPrompt: summarizePrompt(executionPlan.prompt),
+        prompt: executionPlan.prompt,
       });
       setActiveSession(context.chatId, sessionId);
     }
@@ -423,6 +428,22 @@ function parseIncomingCommand(text, requirePrefix) {
   }
   if (lower === "sessions") {
     return { kind: "sessions" };
+  }
+  if (lower === "history" || lower.startsWith("history ")) {
+    const remainder = commandLine.slice(7).trim();
+    const tokens = remainder ? remainder.split(/\s+/u) : [];
+    let selection = "";
+    let limit = 5;
+    for (const token of tokens) {
+      if (!selection && isResumeSelector(token)) {
+        selection = token;
+        continue;
+      }
+      if (/^\d+$/u.test(token)) {
+        limit = Number(token);
+      }
+    }
+    return { kind: "history", selection, limit: Math.max(1, Math.min(limit, 10)) };
   }
 
   if (lower === "new" || lower.startsWith("new ")) {
@@ -728,6 +749,45 @@ async function replyText(chatId, text) {
   }
 }
 
+async function replySessions(chatId) {
+  const sessions = listSessionsForChat(chatId);
+  const active = getChatState(chatId).activeSessionId;
+  const text = formatSessions(chatId);
+
+  if (config.dryRunFeishu) {
+    console.log(`[bridge] dry-run sessions card for ${chatId}:\n${text}`);
+    return;
+  }
+
+  try {
+    await replyCard(chatId, buildSessionsCard(sessions, active, text));
+  } catch (error) {
+    console.error(`[bridge] card reply failed, falling back to text: ${error.message}`);
+    await replyText(chatId, text);
+  }
+}
+
+async function replyCard(chatId, card) {
+  const tenantToken = await getTenantAccessToken(config);
+  const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      Authorization: `Bearer ${tenantToken}`,
+    },
+    body: JSON.stringify({
+      receive_id: chatId,
+      msg_type: "interactive",
+      content: JSON.stringify(card),
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const data = await response.json();
+  if (!response.ok || data.code !== 0) {
+    throw new Error(`Feishu card send failed: HTTP ${response.status} code=${data.code} msg=${data.msg}`);
+  }
+}
+
 async function getTenantAccessToken(config) {
   if (tenantTokenCache.token && tenantTokenCache.expiresAt > Date.now()) {
     return tenantTokenCache.token;
@@ -837,6 +897,13 @@ function clearActiveSession(chatId) {
 function recordSession(chatId, sessionId, data) {
   const existing = bridgeState.sessions[sessionId] ?? {};
   const now = new Date().toISOString();
+  const prompts = Array.isArray(existing.prompts) ? existing.prompts.slice(0, 19) : [];
+  if (data.prompt) {
+    prompts.unshift({
+      ts: Math.floor(Date.now() / 1000),
+      text: data.prompt,
+    });
+  }
   bridgeState.sessions[sessionId] = {
     id: sessionId,
     title: data.title || existing.title || "",
@@ -844,6 +911,7 @@ function recordSession(chatId, sessionId, data) {
     createdAt: existing.createdAt || now,
     updatedAt: now,
     lastPrompt: data.lastPrompt || existing.lastPrompt || "",
+    prompts,
   };
   const chatState = getChatState(chatId);
   chatState.activeSessionId = sessionId;
@@ -891,6 +959,117 @@ function formatSessions(chatId) {
     "",
     "Use '/codex resume N' or '/codex resume <session-id>' to switch the active thread.",
   ].join("\n");
+}
+
+function buildSessionsCard(sessions, activeId, fallbackText) {
+  if (sessions.length === 0) {
+    return {
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: "plain_text", content: "Codex Sessions" },
+        template: "blue",
+      },
+      elements: [
+        {
+          tag: "markdown",
+          content: fallbackText,
+        },
+      ],
+    };
+  }
+
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: "plain_text", content: "Codex Sessions" },
+      template: "blue",
+    },
+    elements: [
+      {
+        tag: "markdown",
+        content: sessions
+          .slice(0, 10)
+          .map((session, index) => {
+            const marker = session.id === activeId ? "ACTIVE" : " ";
+            const shortId = session.id.slice(0, 8);
+            const title = escapeLarkMd(session.title || "(untitled)");
+            const cwd = escapeLarkMd(session.cwd || "(unknown)");
+            return `**${index + 1}. ${title}**\n- status: ${marker}\n- id: \`${shortId}\`\n- cwd: \`${cwd}\``;
+          })
+          .join("\n\n"),
+      },
+      {
+        tag: "hr",
+      },
+      {
+        tag: "markdown",
+        content: "Use `/codex resume N` to switch, `/codex history` to inspect recent prompts.",
+      },
+    ],
+  };
+}
+
+function formatHistory(chatId, selection, limit) {
+  const selected = resolveResumeSelection(chatId, selection);
+  if (!selected) {
+    return `No session found for history.\n\n${formatSessions(chatId)}`;
+  }
+
+  const entries = readSessionHistory(selected.id, limit, selected);
+  if (entries.length === 0) {
+    return [
+      `History for ${selected.id}`,
+      `title=${selected.title || "(untitled)"}`,
+      "No local prompt history found for this session yet.",
+    ].join("\n");
+  }
+
+  return [
+    `History for ${selected.id}`,
+    `title=${selected.title || "(untitled)"}`,
+    `cwd=${selected.cwd || "(unknown)"}`,
+    "",
+    ...entries.map((entry, index) => `${index + 1}. ${formatTimestamp(entry.ts)}\n${truncate(entry.text, 500)}`),
+  ].join("\n\n");
+}
+
+function readSessionHistory(sessionId, limit, sessionRecord = null) {
+  const bridgeEntries = Array.isArray(sessionRecord?.prompts) ? sessionRecord.prompts.slice(0, limit) : [];
+  if (bridgeEntries.length > 0) {
+    return bridgeEntries;
+  }
+
+  const historyPath = path.join(process.env.HOME ?? ".", ".codex", "history.jsonl");
+  if (!fs.existsSync(historyPath)) {
+    return [];
+  }
+  const lines = fs.readFileSync(historyPath, "utf8").split(/\r?\n/u);
+  const entries = [];
+  for (let index = lines.length - 1; index >= 0 && entries.length < limit; index -= 1) {
+    const line = lines[index]?.trim();
+    if (!line) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.session_id === sessionId && parsed.text) {
+        entries.push({
+          ts: Number(parsed.ts) || 0,
+          text: String(parsed.text),
+        });
+      }
+    } catch {
+      // Ignore malformed lines.
+    }
+  }
+  return entries;
+}
+
+function formatTimestamp(ts) {
+  if (!ts) {
+    return "(unknown time)";
+  }
+  return new Date(ts * 1000).toISOString();
 }
 
 function formatStatus(chatId) {
@@ -1043,6 +1222,8 @@ function helpText(config, chatState) {
     "/codex ping",
     "/codex status",
     "/codex sessions",
+    "/codex history",
+    "/codex history 2 6",
     "/codex new",
     "/codex new",
     "cwd=repo-or-absolute-path",
@@ -1056,6 +1237,14 @@ function helpText(config, chatState) {
     `active_session=${chatState.activeSessionId || "(none)"}`,
     `default_cwd=${config.defaultCwd || "(unset)"}`,
   ].join("\n");
+}
+
+function escapeLarkMd(text) {
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\*/g, "\\*")
+    .replace(/`/g, "\\`")
+    .replace(/_/g, "\\_");
 }
 
 function parseDotEnv(text) {

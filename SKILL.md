@@ -67,7 +67,7 @@ sandbox=workspace-write
 
 ### `scripts/bridge-server.mjs`
 
-Run the HTTP bridge. It accepts Feishu events, validates them, queues tasks, invokes `codex exec --json`, and replies back to the chat.
+Run the bridge. It accepts Feishu events, validates them, queues tasks, invokes `codex exec --json`, keeps one active Codex session per Feishu chat, and replies back to the chat.
 
 ### `scripts/doctor.mjs`
 

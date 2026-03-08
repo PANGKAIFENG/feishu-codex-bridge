@@ -15,6 +15,10 @@ check(Boolean(config.FEISHU_APP_ID), "FEISHU_APP_ID is set", failures);
 check(Boolean(config.FEISHU_APP_SECRET), "FEISHU_APP_SECRET is set", failures);
 check(Boolean(config.CODEX_DEFAULT_CWD), "CODEX_DEFAULT_CWD is set", failures);
 check(["websocket", "webhook"].includes(config.FEISHU_CONNECTION_MODE || "websocket"), "FEISHU_CONNECTION_MODE is valid", failures);
+if (config.BRIDGE_STATE_FILE) {
+  const stateDir = path.dirname(path.resolve(config.BRIDGE_STATE_FILE));
+  check(fs.existsSync(stateDir), `state directory exists: ${stateDir}`, failures);
+}
 
 const allowedDirs = splitCsv(config.CODEX_ALLOWED_DIRS || config.CODEX_DEFAULT_CWD || "");
 for (const dir of allowedDirs) {

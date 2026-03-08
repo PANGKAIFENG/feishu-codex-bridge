@@ -14,6 +14,8 @@ const config = buildConfig(env);
 validateConfig(config);
 
 const seenEvents = new Map();
+const bridgeState = loadBridgeState(config.stateFile);
+
 let activeTasks = 0;
 let taskSeq = 0;
 let tenantTokenCache = { token: "", expiresAt: 0 };
@@ -31,6 +33,7 @@ const healthServer = http.createServer(async (req, res) => {
         maxConcurrent: config.maxConcurrent,
         routePath: config.routePath,
         defaultCwd: config.defaultCwd,
+        stateFile: config.stateFile,
       });
     }
 
@@ -58,6 +61,7 @@ healthServer.listen(config.port, config.host, () => {
     console.log(`[bridge] webhook route listening on http://${config.host}:${config.port}${config.routePath}`);
   }
   console.log(`[bridge] env file: ${envPath}`);
+  console.log(`[bridge] state file: ${config.stateFile}`);
 });
 
 if (config.connectionMode === "websocket") {
@@ -165,8 +169,11 @@ async function handleMessage(context) {
   if (parsed.kind === "ignore") {
     return;
   }
+
+  const chatState = getChatState(context.chatId);
+
   if (parsed.kind === "help") {
-    await replyText(context.chatId, helpText(config));
+    await replyText(context.chatId, helpText(config, chatState));
     return;
   }
   if (parsed.kind === "ping") {
@@ -176,23 +183,37 @@ async function handleMessage(context) {
         "pong",
         `mode=${config.connectionMode}`,
         `active=${activeTasks}`,
+        `active_session=${chatState.activeSessionId || "(none)"}`,
         `default_cwd=${config.defaultCwd ?? "(unset)"}`,
       ].join("\n"),
     );
     return;
   }
   if (parsed.kind === "status") {
-    await replyText(
-      context.chatId,
-      [
-        "status",
-        `mode=${config.connectionMode}`,
-        `active=${activeTasks}`,
-        `max_concurrent=${config.maxConcurrent}`,
-        `default_cwd=${config.defaultCwd ?? "(unset)"}`,
-        `allowed_dirs=${config.allowedDirs.join(", ") || "(none)"}`,
-      ].join("\n"),
-    );
+    await replyText(context.chatId, formatStatus(context.chatId));
+    return;
+  }
+  if (parsed.kind === "sessions") {
+    await replyText(context.chatId, formatSessions(context.chatId));
+    return;
+  }
+  if (parsed.kind === "new" && !parsed.body) {
+    clearActiveSession(context.chatId);
+    await replyText(context.chatId, "Started new-thread mode for this chat. The next /codex task will create a fresh Codex session.");
+    return;
+  }
+  if (parsed.kind === "resume" && !parsed.selection && !parsed.body) {
+    await replyText(context.chatId, formatSessions(context.chatId));
+    return;
+  }
+  if (parsed.kind === "resume" && parsed.selection && !parsed.body) {
+    const selected = resolveResumeSelection(context.chatId, parsed.selection);
+    if (!selected) {
+      await replyText(context.chatId, `Session not found: ${parsed.selection}\n\n${formatSessions(context.chatId)}`);
+      return;
+    }
+    setActiveSession(context.chatId, selected.id);
+    await replyText(context.chatId, `Active session set to ${selected.id}\n${selected.title ? `title=${selected.title}\n` : ""}cwd=${selected.cwd || "(unknown)"}`);
     return;
   }
 
@@ -201,24 +222,42 @@ async function handleMessage(context) {
     return;
   }
 
-  const taskRequest = buildTaskRequest(parsed, config);
+  const executionPlan = buildExecutionPlan(context, parsed, config);
   const taskId = `task-${Date.now()}-${++taskSeq}`;
   activeTasks += 1;
 
   await replyText(
     context.chatId,
-    [`Accepted ${taskId}`, `cwd=${taskRequest.cwd}`, `sandbox=${taskRequest.sandbox}`, `Starting Codex...`].join("\n"),
+    [
+      `Accepted ${taskId}`,
+      `mode=${executionPlan.mode}`,
+      `session=${executionPlan.sessionId || "(new)"}`,
+      `cwd=${executionPlan.cwd}`,
+      `sandbox=${executionPlan.sandbox}`,
+      "Starting Codex...",
+    ].join("\n"),
   );
 
   const startedAt = Date.now();
   try {
-    const result = await runCodexTask(taskRequest, config);
+    const result = await runCodexTask(executionPlan, config);
+    const sessionId = result.threadId || executionPlan.sessionId || "";
+    if (sessionId) {
+      recordSession(context.chatId, sessionId, {
+        cwd: executionPlan.cwd,
+        title: resolveSessionTitle(sessionId, executionPlan.prompt),
+        lastPrompt: summarizePrompt(executionPlan.prompt),
+      });
+      setActiveSession(context.chatId, sessionId);
+    }
+
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
     const summary = [
       `Completed ${taskId}`,
-      `cwd=${taskRequest.cwd}`,
+      `mode=${executionPlan.mode}`,
+      `session=${sessionId || "(unknown)"}`,
+      `cwd=${executionPlan.cwd}`,
       `duration=${seconds}s`,
-      result.threadId ? `thread=${result.threadId}` : "",
       result.usage ? `usage=in ${result.usage.input_tokens} / out ${result.usage.output_tokens}` : "",
       "",
       truncate(result.finalMessage || "Codex returned no final message.", 3500),
@@ -228,34 +267,120 @@ async function handleMessage(context) {
     await replyText(context.chatId, summary);
   } catch (error) {
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
-    const failure = [
-      `Failed ${taskId}`,
-      `cwd=${taskRequest.cwd}`,
-      `duration=${seconds}s`,
-      truncate(error.message, 3500),
-    ].join("\n");
-    await replyText(context.chatId, failure);
+    await replyText(
+      context.chatId,
+      [
+        `Failed ${taskId}`,
+        `mode=${executionPlan.mode}`,
+        `session=${executionPlan.sessionId || "(new)"}`,
+        `cwd=${executionPlan.cwd}`,
+        `duration=${seconds}s`,
+        truncate(error.message, 3500),
+      ].join("\n"),
+    );
   } finally {
     activeTasks -= 1;
   }
 }
 
-function buildTaskRequest(parsed, config) {
-  const cwd = resolveCwd(parsed.meta.cwd, config);
-  const sandbox = parsed.meta.sandbox || config.sandbox;
+function buildExecutionPlan(context, parsed, config) {
+  if (parsed.kind === "new") {
+    const request = buildTaskRequest(parsed.meta, parsed.body, config);
+    return {
+      mode: "new",
+      sessionId: "",
+      cwd: request.cwd,
+      sandbox: request.sandbox,
+      model: request.model,
+      prompt: request.prompt,
+    };
+  }
+
+  if (parsed.kind === "resume") {
+    const selected = resolveResumeSelection(context.chatId, parsed.selection);
+    if (!selected) {
+      throw new Error(`Session not found: ${parsed.selection}`);
+    }
+    const request = buildResumeTaskRequest(parsed.meta, parsed.body, config, selected);
+    return {
+      mode: "resume",
+      sessionId: selected.id,
+      cwd: selected.cwd,
+      sandbox: request.sandbox,
+      model: request.model,
+      prompt: request.prompt,
+    };
+  }
+
+  const chatState = getChatState(context.chatId);
+  const activeSession = chatState.activeSessionId ? getSessionRecord(chatState.activeSessionId) : null;
+  if (activeSession) {
+    const request = buildResumeTaskRequest(parsed.meta, parsed.body, config, activeSession);
+    return {
+      mode: "resume",
+      sessionId: activeSession.id,
+      cwd: activeSession.cwd || config.defaultCwd,
+      sandbox: request.sandbox,
+      model: request.model,
+      prompt: request.prompt,
+    };
+  }
+
+  const request = buildTaskRequest(parsed.meta, parsed.body, config);
+  return {
+    mode: "new",
+    sessionId: "",
+    cwd: request.cwd,
+    sandbox: request.sandbox,
+    model: request.model,
+    prompt: request.prompt,
+  };
+}
+
+function buildTaskRequest(meta, body, config) {
+  const cwd = resolveCwd(meta.cwd, config);
+  const sandbox = meta.sandbox || config.sandbox;
   if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox)) {
     throw new Error(`Unsupported sandbox: ${sandbox}`);
   }
   if (sandbox === "danger-full-access" && !config.useDangerous) {
     throw new Error("danger-full-access is disabled by CODEX_USE_DANGEROUS=false");
   }
-  const model = parsed.meta.model || config.model;
-  const promptBody = parsed.body.trim();
+  const promptBody = String(body || "").trim();
   if (!promptBody) {
     throw new Error("Empty Codex task body.");
   }
   const prompt = config.promptPrefix ? `${config.promptPrefix.trim()}\n\n${promptBody}` : promptBody;
-  return { cwd, sandbox, model, prompt };
+  return {
+    cwd,
+    sandbox,
+    model: meta.model || config.model,
+    prompt,
+  };
+}
+
+function buildResumeTaskRequest(meta, body, config, sessionRecord) {
+  if (meta.cwd && sessionRecord.cwd && path.resolve(meta.cwd) !== path.resolve(sessionRecord.cwd)) {
+    throw new Error("Cannot change cwd while resuming an existing session. Use /codex new for a fresh thread.");
+  }
+  const sandbox = meta.sandbox || config.sandbox;
+  if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox)) {
+    throw new Error(`Unsupported sandbox: ${sandbox}`);
+  }
+  if (sandbox === "danger-full-access" && !config.useDangerous) {
+    throw new Error("danger-full-access is disabled by CODEX_USE_DANGEROUS=false");
+  }
+  const promptBody = String(body || "").trim();
+  if (!promptBody) {
+    throw new Error("Empty Codex task body.");
+  }
+  const prompt = config.promptPrefix ? `${config.promptPrefix.trim()}\n\n${promptBody}` : promptBody;
+  return {
+    cwd: sessionRecord.cwd || resolveCwd(config.defaultCwd, config),
+    sandbox,
+    model: meta.model || config.model,
+    prompt,
+  };
 }
 
 function parseIncomingCommand(text, requirePrefix) {
@@ -283,20 +408,64 @@ function parseIncomingCommand(text, requirePrefix) {
   if (!normalized) {
     return { kind: "help" };
   }
-  if (normalized === "help") {
+
+  const commandLine = bodyLines[0] ?? "";
+  const lower = commandLine.toLowerCase();
+
+  if (lower === "help") {
     return { kind: "help" };
   }
-  if (normalized === "ping") {
+  if (lower === "ping") {
     return { kind: "ping" };
   }
-  if (normalized === "status") {
+  if (lower === "status") {
     return { kind: "status" };
   }
+  if (lower === "sessions") {
+    return { kind: "sessions" };
+  }
 
+  if (lower === "new" || lower.startsWith("new ")) {
+    const remainder = commandLine.slice(3).trim();
+    const task = parseTaskLines(remainder ? [remainder, ...bodyLines.slice(1)] : bodyLines.slice(1));
+    return { kind: "new", meta: task.meta, body: task.body };
+  }
+
+  if (lower === "resume" || lower.startsWith("resume ")) {
+    const remainder = commandLine.slice(6).trim();
+    const tokens = remainder ? remainder.split(/\s+/u) : [];
+    let selection = "";
+    let initialBodyLines = bodyLines.slice(1);
+
+    if (tokens.length > 0 && isResumeSelector(tokens[0])) {
+      selection = tokens[0];
+      const trailing = remainder.slice(selection.length).trim();
+      if (trailing) {
+        initialBodyLines = [trailing, ...initialBodyLines];
+      }
+    } else if (remainder) {
+      initialBodyLines = [remainder, ...initialBodyLines];
+    }
+
+    const task = parseTaskLines(initialBodyLines);
+    return {
+      kind: "resume",
+      selection,
+      meta: task.meta,
+      body: task.body,
+    };
+  }
+
+  const task = parseTaskLines(bodyLines);
+  return { kind: "task", meta: task.meta, body: task.body };
+}
+
+function parseTaskLines(lines) {
   const meta = {};
   const promptLines = [];
   let parsingMeta = true;
-  for (const line of bodyLines) {
+
+  for (const line of lines) {
     if (!line) {
       if (!parsingMeta || promptLines.length > 0) {
         promptLines.push("");
@@ -314,39 +483,58 @@ function parseIncomingCommand(text, requirePrefix) {
     promptLines.push(line);
   }
 
-  return { kind: "task", meta, body: promptLines.join("\n").trim() };
+  return {
+    meta,
+    body: promptLines.join("\n").trim(),
+  };
 }
 
-async function runCodexTask(taskRequest, config) {
+function isResumeSelector(token) {
+  return token === "last" || /^\d+$/u.test(token) || /^[0-9a-f]{8}-[0-9a-f-]{27}$/iu.test(token);
+}
+
+async function runCodexTask(executionPlan, config) {
   const args = [];
   if (config.profile) {
     args.push("-p", config.profile);
   }
-  if (taskRequest.model) {
-    args.push("-m", taskRequest.model);
+  if (executionPlan.model) {
+    args.push("-m", executionPlan.model);
   }
   args.push("-a", "never");
-  args.push(
-    "exec",
-    "--json",
-    "--skip-git-repo-check",
-    "-C",
-    taskRequest.cwd,
-    "--sandbox",
-    taskRequest.sandbox,
-    taskRequest.prompt,
-  );
+
+  if (executionPlan.mode === "resume") {
+    args.push(
+      "exec",
+      "resume",
+      "--json",
+      "--skip-git-repo-check",
+      executionPlan.sessionId,
+      executionPlan.prompt,
+    );
+  } else {
+    args.push(
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "-C",
+      executionPlan.cwd,
+      "--sandbox",
+      executionPlan.sandbox,
+      executionPlan.prompt,
+    );
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(config.codexBin, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
-      cwd: taskRequest.cwd,
+      cwd: executionPlan.cwd,
     });
 
     let finalMessage = "";
     let usage = null;
-    let threadId = "";
+    let threadId = executionPlan.sessionId || "";
     let stderr = "";
     let settled = false;
 
@@ -419,10 +607,11 @@ async function runCodexTask(taskRequest, config) {
 function resolveCwd(requested, config) {
   const base = config.defaultCwd ? path.resolve(config.defaultCwd) : null;
   let candidate;
-  if (requested) {
-    candidate = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(base ?? process.cwd(), requested);
-  } else if (base) {
+
+  if (!requested && base) {
     candidate = base;
+  } else if (requested) {
+    candidate = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(base ?? process.cwd(), requested);
   } else {
     throw new Error("No cwd was supplied and CODEX_DEFAULT_CWD is unset.");
   }
@@ -566,6 +755,197 @@ async function getTenantAccessToken(config) {
   return tenantTokenCache.token;
 }
 
+function loadBridgeState(stateFile) {
+  try {
+    if (!fs.existsSync(stateFile)) {
+      ensureParentDir(stateFile);
+      return { version: 1, chats: {}, sessions: {} };
+    }
+    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return {
+      version: 1,
+      chats: parsed.chats ?? {},
+      sessions: parsed.sessions ?? {},
+    };
+  } catch (error) {
+    console.error(`[bridge] failed to load state file ${stateFile}: ${error.message}`);
+    return { version: 1, chats: {}, sessions: {} };
+  }
+}
+
+function saveBridgeState() {
+  ensureParentDir(config.stateFile);
+  const tempFile = `${config.stateFile}.tmp`;
+  fs.writeFileSync(tempFile, JSON.stringify(bridgeState, null, 2));
+  fs.renameSync(tempFile, config.stateFile);
+}
+
+function ensureParentDir(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+}
+
+function getChatState(chatId) {
+  if (!bridgeState.chats[chatId]) {
+    bridgeState.chats[chatId] = {
+      activeSessionId: "",
+      sessionIds: [],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return bridgeState.chats[chatId];
+}
+
+function getSessionRecord(sessionId) {
+  const stored = bridgeState.sessions[sessionId];
+  if (stored) {
+    return stored;
+  }
+  const meta = readSessionIndexEntry(sessionId);
+  if (!meta) {
+    return null;
+  }
+  return {
+    id: sessionId,
+    title: meta.thread_name || "",
+    cwd: "",
+    createdAt: meta.updated_at || new Date().toISOString(),
+    updatedAt: meta.updated_at || new Date().toISOString(),
+    lastPrompt: "",
+  };
+}
+
+function setActiveSession(chatId, sessionId) {
+  const chatState = getChatState(chatId);
+  chatState.activeSessionId = sessionId;
+  chatState.updatedAt = new Date().toISOString();
+  if (sessionId && !chatState.sessionIds.includes(sessionId)) {
+    chatState.sessionIds.unshift(sessionId);
+  }
+  if (chatState.sessionIds.length > 30) {
+    chatState.sessionIds = chatState.sessionIds.slice(0, 30);
+  }
+  saveBridgeState();
+}
+
+function clearActiveSession(chatId) {
+  const chatState = getChatState(chatId);
+  chatState.activeSessionId = "";
+  chatState.updatedAt = new Date().toISOString();
+  saveBridgeState();
+}
+
+function recordSession(chatId, sessionId, data) {
+  const existing = bridgeState.sessions[sessionId] ?? {};
+  const now = new Date().toISOString();
+  bridgeState.sessions[sessionId] = {
+    id: sessionId,
+    title: data.title || existing.title || "",
+    cwd: data.cwd || existing.cwd || "",
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+    lastPrompt: data.lastPrompt || existing.lastPrompt || "",
+  };
+  const chatState = getChatState(chatId);
+  chatState.activeSessionId = sessionId;
+  chatState.updatedAt = now;
+  chatState.sessionIds = [sessionId, ...chatState.sessionIds.filter((id) => id !== sessionId)].slice(0, 30);
+  saveBridgeState();
+}
+
+function resolveResumeSelection(chatId, selection) {
+  if (!selection) {
+    const activeId = getChatState(chatId).activeSessionId;
+    return activeId ? getSessionRecord(activeId) : null;
+  }
+  const sessions = listSessionsForChat(chatId);
+  if (selection === "last") {
+    return sessions[0] ?? null;
+  }
+  if (/^\d+$/u.test(selection)) {
+    return sessions[Number(selection) - 1] ?? null;
+  }
+  return getSessionRecord(selection);
+}
+
+function listSessionsForChat(chatId) {
+  const chatState = getChatState(chatId);
+  return chatState.sessionIds
+    .map((id) => getSessionRecord(id))
+    .filter(Boolean)
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+function formatSessions(chatId) {
+  const sessions = listSessionsForChat(chatId);
+  const active = getChatState(chatId).activeSessionId;
+  if (sessions.length === 0) {
+    return "No recorded sessions for this chat yet.\nUse /codex with a task to create the first thread.";
+  }
+  return [
+    "Sessions for this chat:",
+    ...sessions.slice(0, 10).map((session, index) => {
+      const marker = session.id === active ? "*" : " ";
+      const shortId = session.id.slice(0, 8);
+      return `${index + 1}. [${marker}] ${session.title || "(untitled)"} | id=${shortId} | cwd=${session.cwd || "(unknown)"}`;
+    }),
+    "",
+    "Use '/codex resume N' or '/codex resume <session-id>' to switch the active thread.",
+  ].join("\n");
+}
+
+function formatStatus(chatId) {
+  const chatState = getChatState(chatId);
+  const active = chatState.activeSessionId ? getSessionRecord(chatState.activeSessionId) : null;
+  return [
+    "status",
+    `mode=${config.connectionMode}`,
+    `active=${activeTasks}`,
+    `max_concurrent=${config.maxConcurrent}`,
+    `active_session=${chatState.activeSessionId || "(none)"}`,
+    `active_title=${active?.title || "(none)"}`,
+    `active_cwd=${active?.cwd || config.defaultCwd || "(unknown)"}`,
+    `tracked_sessions=${chatState.sessionIds.length}`,
+  ].join("\n");
+}
+
+function resolveSessionTitle(sessionId, prompt) {
+  const fromIndex = readSessionIndexEntry(sessionId);
+  if (fromIndex?.thread_name) {
+    return fromIndex.thread_name;
+  }
+  return summarizePrompt(prompt, 80);
+}
+
+function readSessionIndexEntry(sessionId) {
+  const indexPath = path.join(process.env.HOME ?? ".", ".codex", "session_index.jsonl");
+  if (!fs.existsSync(indexPath)) {
+    return null;
+  }
+  const lines = fs.readFileSync(indexPath, "utf8").trim().split(/\r?\n/u).reverse();
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.id === sessionId) {
+        return parsed;
+      }
+    } catch {
+      // Ignore invalid lines.
+    }
+  }
+  return null;
+}
+
+function summarizePrompt(prompt, limit = 60) {
+  const firstLine = String(prompt || "").trim().split(/\r?\n/u)[0] ?? "";
+  if (firstLine.length <= limit) {
+    return firstLine;
+  }
+  return `${firstLine.slice(0, Math.max(limit - 3, 0))}...`;
+}
+
 function isDuplicateEvent(eventId) {
   cleanupSeenEvents();
   if (seenEvents.has(eventId)) {
@@ -586,7 +966,7 @@ function cleanupSeenEvents() {
 
 function buildConfig(env) {
   const defaultCwd = env.CODEX_DEFAULT_CWD ? path.resolve(env.CODEX_DEFAULT_CWD) : "";
-  const allowedDirs = splitCsv(env.CODEX_ALLOWED_DIRS || defaultCwd).map((dir) => path.resolve(dir));
+  const defaultStateFile = path.join(process.env.HOME ?? ".", ".config", "feishu-codex-bridge", "state.json");
   return {
     host: env.HOST || "127.0.0.1",
     port: Number(env.PORT || 8787),
@@ -609,9 +989,10 @@ function buildConfig(env) {
     useDangerous: parseBoolean(env.CODEX_USE_DANGEROUS, false),
     maxConcurrent: Number(env.CODEX_MAX_CONCURRENT || 1),
     defaultCwd,
-    allowedDirs,
+    allowedDirs: splitCsv(env.CODEX_ALLOWED_DIRS || defaultCwd).map((dir) => path.resolve(dir)),
     promptPrefix: env.CODEX_PROMPT_PREFIX || "",
     dryRunFeishu: parseBoolean(env.BRIDGE_DRY_RUN_FEISHU, false),
+    stateFile: path.resolve(env.BRIDGE_STATE_FILE || defaultStateFile),
   };
 }
 
@@ -656,24 +1037,29 @@ function sanitizeIncomingText(text) {
     .trim();
 }
 
-function helpText(config) {
+function helpText(config, chatState) {
   return [
     "Usage:",
     "/codex ping",
     "/codex status",
-    "/codex help",
-    "/codex",
+    "/codex sessions",
+    "/codex new",
+    "/codex new",
     "cwd=repo-or-absolute-path",
-    "sandbox=workspace-write",
+    "Your new task here",
+    "/codex resume",
+    "/codex resume 2",
+    "/codex",
     "Your task here",
     "",
     `mode=${config.connectionMode}`,
+    `active_session=${chatState.activeSessionId || "(none)"}`,
     `default_cwd=${config.defaultCwd || "(unset)"}`,
   ].join("\n");
 }
 
 function parseDotEnv(text) {
-  const env = {};
+  const parsed = {};
   for (const rawLine of text.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) {
@@ -688,9 +1074,9 @@ function parseDotEnv(text) {
     if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
-    env[key] = value;
+    parsed[key] = value;
   }
-  return env;
+  return parsed;
 }
 
 function splitCsv(value) {

@@ -16,6 +16,8 @@ Default mode is `websocket` long connection, which does not require a public cal
 - Restricts execution to approved working directories
 - Runs `codex exec --json`
 - Sends the result back to the same Feishu chat
+- Keeps one active Codex session per Feishu chat by default
+- Supports `/codex new`, `/codex resume`, and `/codex sessions`
 - Supports unattended operation on macOS via LaunchAgent
 
 ## Current scope
@@ -26,6 +28,7 @@ Default mode is `websocket` long connection, which does not require a public cal
 - `webhook` callback mode is still available for compatibility
 - Feishu verification token validation
 - Encrypted payload handling is only delegated through the Feishu SDK path; the custom webhook parser still assumes plain payloads
+- Sticky chat threads are tracked in a local JSON state file on the host
 
 ## Prerequisites
 
@@ -89,6 +92,8 @@ node scripts/doctor.mjs --env ~/.config/feishu-codex-bridge/.env --smoke
 ```bash
 ./scripts/install-launch-agent.sh ~/.config/feishu-codex-bridge/.env
 ```
+
+After the LaunchAgent is loaded, the bridge keeps running even if you close the terminal window or log out of that shell session.
 
 ## Feishu bot setup
 
@@ -189,6 +194,7 @@ The bridge uses these env vars from your Feishu app:
 - `FEISHU_APP_ID`: used to fetch a tenant access token
 - `FEISHU_APP_SECRET`: used to fetch a tenant access token
 - `FEISHU_VERIFICATION_TOKEN`: used to verify incoming callback payloads
+- `BRIDGE_STATE_FILE`: optional path for chat-to-session mappings; defaults under `~/.config/feishu-codex-bridge/state.json`
 
 The bridge then uses the tenant access token to call Feishu's send-message API and reply in chat.
 
@@ -200,6 +206,7 @@ Basic health checks:
 /codex ping
 /codex status
 /codex help
+/codex sessions
 ```
 
 Task request:
@@ -216,6 +223,63 @@ Supported metadata keys:
 - `cwd=...`
 - `sandbox=read-only|workspace-write|danger-full-access`
 - `model=...`
+
+### Persistent threads and session commands
+
+By default, each Feishu chat keeps one active Codex session.
+
+That means:
+
+- The first `/codex` task creates a new Codex session
+- Later `/codex` tasks in the same chat resume that same session automatically
+- The mapping survives service restarts through the local bridge state file
+
+Commands:
+
+```text
+/codex sessions
+```
+
+List recent sessions tracked for the current Feishu chat.
+
+```text
+/codex new
+```
+
+Clear the active session for this chat. The next `/codex` task starts a fresh thread.
+
+```text
+/codex new
+cwd=/path/to/repo
+Start a new thread and inspect the latest error.
+```
+
+Create a brand new Codex session immediately.
+
+```text
+/codex resume
+```
+
+Show the recent sessions for this chat.
+
+```text
+/codex resume 2
+```
+
+Switch the active session to item 2 from `/codex sessions`.
+
+```text
+/codex resume 2
+Continue the previous investigation and restart the service if needed.
+```
+
+Switch the active session and send a new prompt in one message.
+
+Notes:
+
+- `cwd` can be changed only for new sessions
+- Resumed sessions keep their original working directory
+- Session history is persisted for the bridge, but it is still Codex CLI history, not a guaranteed mirror of the desktop app sidebar
 
 Full protocol notes are in [references/message-protocol.md](./references/message-protocol.md).
 

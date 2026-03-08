@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Codex Bridge"
+  short_description: "Run Codex from Feishu chats"
+  default_prompt: "Use $feishu-codex-bridge to deploy or troubleshoot a Feishu bot that runs Codex CLI on a remote machine."

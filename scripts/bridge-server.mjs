@@ -172,6 +172,10 @@ async function handleMessage(context) {
 
   const chatState = getChatState(context.chatId);
 
+  if (parsed.kind === "onboard") {
+    await replyText(context.chatId, onboardText(config, chatState));
+    return;
+  }
   if (parsed.kind === "help") {
     await replyText(context.chatId, helpText(config, chatState));
     return;
@@ -398,6 +402,10 @@ function parseIncomingCommand(text, requirePrefix) {
   const firstLine = lines[0] ?? "";
   let bodyLines = lines.slice();
 
+  if (firstLine === "/onboard") {
+    return { kind: "onboard" };
+  }
+
   if (requirePrefix) {
     if (!firstLine.startsWith("/codex")) {
       return { kind: "ignore" };
@@ -417,6 +425,9 @@ function parseIncomingCommand(text, requirePrefix) {
   const commandLine = bodyLines[0] ?? "";
   const lower = commandLine.toLowerCase();
 
+  if (lower === "onboard") {
+    return { kind: "onboard" };
+  }
   if (lower === "help") {
     return { kind: "help" };
   }
@@ -1219,6 +1230,7 @@ function sanitizeIncomingText(text) {
 function helpText(config, chatState) {
   return [
     "Usage:",
+    "/onboard",
     "/codex ping",
     "/codex status",
     "/codex sessions",
@@ -1236,6 +1248,53 @@ function helpText(config, chatState) {
     `mode=${config.connectionMode}`,
     `active_session=${chatState.activeSessionId || "(none)"}`,
     `default_cwd=${config.defaultCwd || "(unset)"}`,
+  ].join("\n");
+}
+
+function onboardText(config, chatState) {
+  return [
+    "Feishu Codex Bridge",
+    "",
+    "What I can do:",
+    "- Run Codex CLI on this Mac for repo inspection, debugging, edits, installs, and command-line fixes",
+    "- Keep one sticky Codex session per Feishu chat",
+    "- Start new threads, resume old threads, and show recent prompt history",
+    "- Run as a background macOS service after LaunchAgent installation",
+    "",
+    "Thread model:",
+    "- First /codex task in this chat creates a new Codex session",
+    "- Later /codex tasks in the same chat resume the active session automatically",
+    `- Current active session: ${chatState.activeSessionId || "(none)"}`,
+    "",
+    "Core commands:",
+    "- /onboard : show this introduction",
+    "- /codex help : short command reference",
+    "- /codex ping : health check",
+    "- /codex status : show mode, active session, cwd, concurrency",
+    "- /codex sessions : list recent sessions for this chat",
+    "- /codex history : show recent prompts for the active session",
+    "- /codex new : clear active session; next task starts fresh",
+    "- /codex new <task> : start a fresh session immediately",
+    "- /codex resume : list/switch sessions",
+    "- /codex resume 2 : set session 2 as active",
+    "- /codex resume 2 <task> : switch and continue in one step",
+    "",
+    "Task format:",
+    "/codex",
+    "cwd=/path/to/repo",
+    "sandbox=workspace-write",
+    "检查 OpenClaw 为什么挂了，并尝试修复",
+    "",
+    "Supported metadata:",
+    "- cwd=... : working directory for new sessions",
+    "- sandbox=read-only|workspace-write|danger-full-access",
+    "- model=... : override default model",
+    "",
+    "Notes:",
+    `- Connection mode: ${config.connectionMode}`,
+    `- Default cwd: ${config.defaultCwd || "(unset)"}`,
+    "- Resumed sessions keep their original cwd",
+    "- If installed as LaunchAgent, the bridge keeps receiving Feishu messages even after you close the terminal",
   ].join("\n");
 }
 

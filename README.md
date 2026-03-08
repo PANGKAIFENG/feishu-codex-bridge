@@ -204,6 +204,7 @@ The bridge then uses the tenant access token to call Feishu's send-message API a
 Basic health checks:
 
 ```text
+/onboard
 /codex ping
 /codex status
 /codex help
@@ -237,6 +238,12 @@ That means:
 - The mapping survives service restarts through the local bridge state file
 
 Commands:
+
+```text
+/onboard
+```
+
+Show a newcomer-friendly overview of the bridge: current capabilities, thread model, command list, and example usage.
 
 ```text
 /codex sessions

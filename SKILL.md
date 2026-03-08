@@ -11,9 +11,10 @@ Use the bundled scripts. Do not rewrite the bridge from scratch unless the user 
 
 1. Read [references/feishu-setup.md](references/feishu-setup.md) before touching Feishu settings.
 2. Copy [assets/feishu-codex-bridge.env.example](assets/feishu-codex-bridge.env.example) to a real `.env` file on the target machine.
-3. Run `scripts/doctor.mjs` to validate `node`, `codex`, the env file, and the configured working directories.
-4. Start the service with `scripts/run-bridge.sh`.
-5. If the machine is a Mac that should stay online, install it with `scripts/install-launch-agent.sh`.
+3. Run `npm install` in the skill directory.
+4. Run `scripts/doctor.mjs` to validate `node`, `codex`, the env file, and the configured working directories.
+5. Start the service with `scripts/run-bridge.sh`.
+6. If the machine is a Mac that should stay online, install it with `scripts/install-launch-agent.sh`.
 
 ## Workflow
 
@@ -28,13 +29,14 @@ Use the bundled scripts. Do not rewrite the bridge from scratch unless the user 
 
 - Create a custom bot app.
 - Enable event subscription for `im.message.receive_v1`.
-- Leave event payload encryption disabled for the first deployment. This bridge validates the verification token but does not decrypt `encrypt` payloads.
-- Point the callback URL at the bridge route, usually `/feishu/events`.
+- Prefer the Feishu long-connection mode. It does not need a public domain.
+- Only configure a callback URL if the user explicitly wants webhook mode.
 - Grant only the permissions needed to receive and send messages.
 
 ### 3. Configure the bridge
 
 - Populate the env file with Feishu app credentials and a strict directory allowlist.
+- Set `FEISHU_CONNECTION_MODE=websocket` unless the user explicitly wants webhook mode.
 - Set `CODEX_REQUIRE_PREFIX=true` unless the bot lives in a dedicated 1:1 chat.
 - Keep `CODEX_SANDBOX=workspace-write` by default.
 - Set `CODEX_USE_DANGEROUS=false` unless the host is already isolated and the user explicitly wants unrestricted execution.
@@ -55,7 +57,8 @@ sandbox=workspace-write
 
 ### 5. Troubleshoot
 
-- If Feishu cannot verify the callback, check the public URL, route, and verification token first.
+- If websocket mode does not receive events, first confirm the app backend is configured for long connection and the Mac Mini can reach the public internet.
+- If webhook mode cannot verify the callback, check the public URL, route, and verification token first.
 - If messages are received but no reply is sent, inspect Feishu app credentials and message send permissions.
 - If the bridge replies with busy errors, increase capacity only after confirming the host can safely run concurrent `codex exec` sessions.
 - If `codex exec` fails, run the same command locally on the host before changing bridge code.

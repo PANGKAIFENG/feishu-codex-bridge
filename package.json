@@ -1,0 +1,14 @@
+{
+  "name": "feishu-codex-bridge",
+  "version": "0.2.0",
+  "private": false,
+  "description": "Feishu bot bridge for running Codex CLI tasks on a remote Mac or Linux host.",
+  "type": "module",
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "start": "node scripts/bridge-server.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.56.0"
+  }
+}

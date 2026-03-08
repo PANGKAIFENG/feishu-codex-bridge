@@ -15,6 +15,20 @@ Subscribe to `im.message.receive_v1`.
 
 For the first deployment, keep event payload encryption disabled. The bundled bridge validates the verification token from the callback payload and rejects encrypted payloads.
 
+## Preferred mode
+
+Prefer long connection.
+
+In the Feishu app console, choose `使用长连接接收事件`.
+
+This avoids:
+
+- registering a public domain
+- exposing a callback path
+- using a reverse proxy only for event delivery
+
+The bundled bridge supports both `websocket` and `webhook`, but `websocket` should be the default.
+
 ## Callback exposure
 
 Feishu must reach the bridge over the public internet. If the Mac Mini stays at home, expose the local bridge with one of these:

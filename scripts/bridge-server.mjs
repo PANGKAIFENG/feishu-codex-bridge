@@ -5,6 +5,7 @@ import path from "node:path";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { URL } from "node:url";
+import * as Lark from "@larksuiteoapi/node-sdk";
 
 const envPath = path.resolve(process.env.FEISHU_CODEX_BRIDGE_ENV ?? path.join(process.env.HOME ?? ".", ".config/feishu-codex-bridge/.env"));
 const fileEnv = fs.existsSync(envPath) ? parseDotEnv(fs.readFileSync(envPath, "utf8")) : {};
@@ -16,19 +17,25 @@ const seenEvents = new Map();
 let activeTasks = 0;
 let taskSeq = 0;
 let tenantTokenCache = { token: "", expiresAt: 0 };
+let wsClient = null;
 
-const server = http.createServer(async (req, res) => {
+const healthServer = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
       return sendJson(res, 200, {
         ok: true,
+        connectionMode: config.connectionMode,
         activeTasks,
         maxConcurrent: config.maxConcurrent,
         routePath: config.routePath,
         defaultCwd: config.defaultCwd,
       });
+    }
+
+    if (config.connectionMode !== "webhook") {
+      return sendJson(res, 404, { ok: false, error: "not_found" });
     }
 
     if (req.method !== "POST" || url.pathname !== config.routePath) {
@@ -37,48 +44,105 @@ const server = http.createServer(async (req, res) => {
 
     const rawBody = await readBody(req);
     const payload = rawBody.length > 0 ? JSON.parse(rawBody.toString("utf8")) : {};
-
-    if (payload.encrypt) {
-      return sendJson(res, 400, { ok: false, error: "encrypted_payload_not_supported" });
-    }
-
-    verifyTokenIfConfigured(payload, config.verificationToken);
-
-    if (payload.type === "url_verification" && payload.challenge) {
-      return sendJson(res, 200, { challenge: payload.challenge });
-    }
-
-    if (payload.header?.event_type !== "im.message.receive_v1") {
-      return sendJson(res, 200, { code: 0, ignored: true });
-    }
-
-    const eventId = payload.header?.event_id ?? payload.event_id ?? `${Date.now()}-${Math.random()}`;
-    cleanupSeenEvents();
-    if (seenEvents.has(eventId)) {
-      return sendJson(res, 200, { code: 0, duplicate: true });
-    }
-    seenEvents.set(eventId, Date.now());
-
-    const context = extractMessageContext(payload);
-    if (!context) {
-      return sendJson(res, 200, { code: 0, ignored: "unsupported_payload" });
-    }
-
-    void handleMessage(context).catch((error) => {
-      console.error(`[bridge] task failure: ${error.stack || error.message}`);
-    });
-
-    return sendJson(res, 200, { code: 0 });
+    const response = await handleWebhookPayload(payload);
+    return sendJson(res, response.statusCode, response.body);
   } catch (error) {
     console.error(`[bridge] request error: ${error.stack || error.message}`);
     return sendJson(res, 500, { ok: false, error: error.message });
   }
 });
 
-server.listen(config.port, config.host, () => {
-  console.log(`[bridge] listening on http://${config.host}:${config.port}${config.routePath}`);
+healthServer.listen(config.port, config.host, () => {
+  console.log(`[bridge] health server listening on http://${config.host}:${config.port}/healthz`);
+  if (config.connectionMode === "webhook") {
+    console.log(`[bridge] webhook route listening on http://${config.host}:${config.port}${config.routePath}`);
+  }
   console.log(`[bridge] env file: ${envPath}`);
 });
+
+if (config.connectionMode === "websocket") {
+  await startWebSocketMode();
+} else {
+  console.log("[bridge] using webhook mode; Feishu must reach the callback URL.");
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+async function startWebSocketMode() {
+  const dispatcher = new Lark.EventDispatcher({
+    verificationToken: config.verificationToken || undefined,
+    encryptKey: config.encryptKey || undefined,
+    loggerLevel: Lark.LoggerLevel.info,
+  }).register({
+    "im.message.receive_v1": async (data) => {
+      const eventId = data.event_id ?? data.uuid ?? data.message?.message_id ?? `${Date.now()}-${Math.random()}`;
+      if (isDuplicateEvent(eventId)) {
+        return;
+      }
+      const context = extractMessageContextFromEvent(data);
+      if (!context) {
+        return;
+      }
+      void handleMessage(context).catch((error) => {
+        console.error(`[bridge] task failure: ${error.stack || error.message}`);
+      });
+    },
+  });
+
+  wsClient = new Lark.WSClient({
+    appId: config.feishuAppId,
+    appSecret: config.feishuAppSecret,
+    loggerLevel: Lark.LoggerLevel.info,
+  });
+
+  await wsClient.start({ eventDispatcher: dispatcher });
+  console.log("[bridge] Feishu long connection started. No public callback URL is required.");
+}
+
+async function shutdown() {
+  try {
+    if (wsClient) {
+      wsClient.close({ force: true });
+    }
+  } catch {
+    // Ignore shutdown errors.
+  }
+  healthServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000).unref();
+}
+
+async function handleWebhookPayload(payload) {
+  if (payload.encrypt) {
+    return { statusCode: 400, body: { ok: false, error: "encrypted_payload_not_supported" } };
+  }
+
+  verifyTokenIfConfigured(payload, config.verificationToken);
+
+  if (payload.type === "url_verification" && payload.challenge) {
+    return { statusCode: 200, body: { challenge: payload.challenge } };
+  }
+
+  if (payload.header?.event_type !== "im.message.receive_v1") {
+    return { statusCode: 200, body: { code: 0, ignored: true } };
+  }
+
+  const eventId = payload.header?.event_id ?? payload.event_id ?? `${Date.now()}-${Math.random()}`;
+  if (isDuplicateEvent(eventId)) {
+    return { statusCode: 200, body: { code: 0, duplicate: true } };
+  }
+
+  const context = extractMessageContextFromPayload(payload);
+  if (!context) {
+    return { statusCode: 200, body: { code: 0, ignored: "unsupported_payload" } };
+  }
+
+  void handleMessage(context).catch((error) => {
+    console.error(`[bridge] task failure: ${error.stack || error.message}`);
+  });
+
+  return { statusCode: 200, body: { code: 0 } };
+}
 
 async function handleMessage(context) {
   if (context.senderType === "bot") {
@@ -106,7 +170,15 @@ async function handleMessage(context) {
     return;
   }
   if (parsed.kind === "ping") {
-    await replyText(context.chatId, `pong\nactive=${activeTasks}\ndefault_cwd=${config.defaultCwd ?? "(unset)"}`);
+    await replyText(
+      context.chatId,
+      [
+        "pong",
+        `mode=${config.connectionMode}`,
+        `active=${activeTasks}`,
+        `default_cwd=${config.defaultCwd ?? "(unset)"}`,
+      ].join("\n"),
+    );
     return;
   }
   if (parsed.kind === "status") {
@@ -114,6 +186,7 @@ async function handleMessage(context) {
       context.chatId,
       [
         "status",
+        `mode=${config.connectionMode}`,
         `active=${activeTasks}`,
         `max_concurrent=${config.maxConcurrent}`,
         `default_cwd=${config.defaultCwd ?? "(unset)"}`,
@@ -139,7 +212,7 @@ async function handleMessage(context) {
 
   const startedAt = Date.now();
   try {
-    const result = await runCodexTask(taskId, taskRequest, config);
+    const result = await runCodexTask(taskRequest, config);
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
     const summary = [
       `Completed ${taskId}`,
@@ -244,7 +317,7 @@ function parseIncomingCommand(text, requirePrefix) {
   return { kind: "task", meta, body: promptLines.join("\n").trim() };
 }
 
-async function runCodexTask(taskId, taskRequest, config) {
+async function runCodexTask(taskRequest, config) {
   const args = [];
   if (config.profile) {
     args.push("-p", config.profile);
@@ -271,11 +344,10 @@ async function runCodexTask(taskId, taskRequest, config) {
       cwd: taskRequest.cwd,
     });
 
-    const stdoutLines = [];
-    let stderr = "";
     let finalMessage = "";
     let usage = null;
     let threadId = "";
+    let stderr = "";
     let settled = false;
 
     const timer = setTimeout(() => {
@@ -285,7 +357,6 @@ async function runCodexTask(taskId, taskRequest, config) {
     }, config.timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdoutLines.push(chunk.toString("utf8"));
       for (const line of chunk.toString("utf8").split(/\r?\n/u)) {
         if (!line.trim().startsWith("{")) {
           continue;
@@ -302,7 +373,7 @@ async function runCodexTask(taskId, taskRequest, config) {
             usage = event.usage;
           }
         } catch {
-          // Ignore non-JSONL lines emitted by the CLI.
+          // Ignore non-JSONL stdout.
         }
       }
     });
@@ -327,17 +398,20 @@ async function runCodexTask(taskId, taskRequest, config) {
       settled = true;
       clearTimeout(timer);
       if (code === 0) {
-        resolve({ taskId, threadId, finalMessage, usage, stdout: stdoutLines.join(""), stderr });
+        resolve({ threadId, finalMessage, usage, stderr });
         return;
       }
-      const message = [
-        `Codex exited with code=${code ?? "null"} signal=${signal ?? "null"}`,
-        finalMessage ? `last_message=${finalMessage}` : "",
-        stderr ? `stderr=${truncate(stderr.trim(), 2000)}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-      reject(new Error(message));
+      reject(
+        new Error(
+          [
+            `Codex exited with code=${code ?? "null"} signal=${signal ?? "null"}`,
+            finalMessage ? `last_message=${finalMessage}` : "",
+            stderr ? `stderr=${truncate(stderr.trim(), 2000)}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        ),
+      );
     });
   });
 }
@@ -364,22 +438,7 @@ function resolveCwd(requested, config) {
   return candidate;
 }
 
-function isAllowedSender(senderIds, config) {
-  if (
-    config.allowedOpenIds.size === 0 &&
-    config.allowedUnionIds.size === 0 &&
-    config.allowedUserIds.size === 0
-  ) {
-    return true;
-  }
-  return (
-    (senderIds.openId && config.allowedOpenIds.has(senderIds.openId)) ||
-    (senderIds.unionId && config.allowedUnionIds.has(senderIds.unionId)) ||
-    (senderIds.userId && config.allowedUserIds.has(senderIds.userId))
-  );
-}
-
-function extractMessageContext(payload) {
+function extractMessageContextFromPayload(payload) {
   const event = payload.event ?? {};
   const message = event.message ?? {};
   const sender = event.sender ?? {};
@@ -404,6 +463,26 @@ function extractMessageContext(payload) {
   };
 }
 
+function extractMessageContextFromEvent(event) {
+  if (!event?.message?.chat_id) {
+    return null;
+  }
+  const senderId = event.sender?.sender_id ?? {};
+  const content = parseMessageContent(event.message.content);
+  return {
+    chatId: event.message.chat_id,
+    messageType: event.message.message_type ?? "",
+    messageId: event.message.message_id ?? "",
+    senderType: event.sender?.sender_type ?? "",
+    senderIds: {
+      openId: senderId.open_id ?? "",
+      unionId: senderId.union_id ?? "",
+      userId: senderId.user_id ?? "",
+    },
+    text: content.text ?? "",
+  };
+}
+
 function parseMessageContent(content) {
   if (!content) {
     return {};
@@ -416,6 +495,21 @@ function parseMessageContent(content) {
   } catch {
     return { text: String(content) };
   }
+}
+
+function isAllowedSender(senderIds, config) {
+  if (
+    config.allowedOpenIds.size === 0 &&
+    config.allowedUnionIds.size === 0 &&
+    config.allowedUserIds.size === 0
+  ) {
+    return true;
+  }
+  return (
+    (senderIds.openId && config.allowedOpenIds.has(senderIds.openId)) ||
+    (senderIds.unionId && config.allowedUnionIds.has(senderIds.unionId)) ||
+    (senderIds.userId && config.allowedUserIds.has(senderIds.userId))
+  );
 }
 
 async function replyText(chatId, text) {
@@ -472,6 +566,24 @@ async function getTenantAccessToken(config) {
   return tenantTokenCache.token;
 }
 
+function isDuplicateEvent(eventId) {
+  cleanupSeenEvents();
+  if (seenEvents.has(eventId)) {
+    return true;
+  }
+  seenEvents.set(eventId, Date.now());
+  return false;
+}
+
+function cleanupSeenEvents() {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [eventId, seenAt] of seenEvents.entries()) {
+    if (seenAt < cutoff) {
+      seenEvents.delete(eventId);
+    }
+  }
+}
+
 function buildConfig(env) {
   const defaultCwd = env.CODEX_DEFAULT_CWD ? path.resolve(env.CODEX_DEFAULT_CWD) : "";
   const allowedDirs = splitCsv(env.CODEX_ALLOWED_DIRS || defaultCwd).map((dir) => path.resolve(dir));
@@ -479,9 +591,11 @@ function buildConfig(env) {
     host: env.HOST || "127.0.0.1",
     port: Number(env.PORT || 8787),
     routePath: env.ROUTE_PATH || "/feishu/events",
+    connectionMode: env.FEISHU_CONNECTION_MODE || "websocket",
     feishuAppId: env.FEISHU_APP_ID || "",
     feishuAppSecret: env.FEISHU_APP_SECRET || "",
     verificationToken: env.FEISHU_VERIFICATION_TOKEN || "",
+    encryptKey: env.FEISHU_ENCRYPT_KEY || "",
     allowedChatIds: new Set(splitCsv(env.FEISHU_ALLOWED_CHAT_IDS || "")),
     allowedOpenIds: new Set(splitCsv(env.FEISHU_ALLOWED_OPEN_IDS || "")),
     allowedUnionIds: new Set(splitCsv(env.FEISHU_ALLOWED_UNION_IDS || "")),
@@ -510,6 +624,9 @@ function validateConfig(config) {
     if (!value) {
       throw new Error(`Missing required env: ${name}`);
     }
+  }
+  if (!["websocket", "webhook"].includes(config.connectionMode)) {
+    throw new Error("FEISHU_CONNECTION_MODE must be 'websocket' or 'webhook'.");
   }
   if (!Number.isFinite(config.port) || config.port <= 0) {
     throw new Error("PORT must be a positive number.");
@@ -550,17 +667,9 @@ function helpText(config) {
     "sandbox=workspace-write",
     "Your task here",
     "",
+    `mode=${config.connectionMode}`,
     `default_cwd=${config.defaultCwd || "(unset)"}`,
   ].join("\n");
-}
-
-function cleanupSeenEvents() {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [eventId, seenAt] of seenEvents.entries()) {
-    if (seenAt < cutoff) {
-      seenEvents.delete(eventId);
-    }
-  }
 }
 
 function parseDotEnv(text) {

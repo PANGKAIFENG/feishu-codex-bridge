@@ -14,6 +14,7 @@ check(fs.existsSync(envPath), `env file exists at ${envPath}`, failures);
 check(Boolean(config.FEISHU_APP_ID), "FEISHU_APP_ID is set", failures);
 check(Boolean(config.FEISHU_APP_SECRET), "FEISHU_APP_SECRET is set", failures);
 check(Boolean(config.CODEX_DEFAULT_CWD), "CODEX_DEFAULT_CWD is set", failures);
+check(["websocket", "webhook"].includes(config.FEISHU_CONNECTION_MODE || "websocket"), "FEISHU_CONNECTION_MODE is valid", failures);
 
 const allowedDirs = splitCsv(config.CODEX_ALLOWED_DIRS || config.CODEX_DEFAULT_CWD || "");
 for (const dir of allowedDirs) {
@@ -30,6 +31,7 @@ check(Number(nodeVersion.slice(1).split(".")[0]) >= 20, `Node.js version is ${no
 
 const codexBin = config.CODEX_BIN || "codex";
 await checkCommand(codexBin, ["--version"], "codex binary is callable", failures);
+await checkCommand("node", ["-e", "import('@larksuiteoapi/node-sdk').then(()=>process.exit(0)).catch(()=>process.exit(1))"], "Feishu SDK dependency is installed", failures);
 
 if (args.smoke) {
   const smokeCwd = path.resolve(config.CODEX_DEFAULT_CWD);

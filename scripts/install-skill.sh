@@ -108,4 +108,5 @@ fi
 echo "Installed $SKILL_NAME to $TARGET_DIR"
 echo "Next steps:"
 echo "  1. Run codex and mention \$feishu-codex-bridge when you want to use the skill."
-echo "  2. If deploying the bridge, read $TARGET_DIR/README.md"
+echo "  2. If deploying the bridge, run 'cd $TARGET_DIR && npm install'"
+echo "  3. Then read $TARGET_DIR/README.md"
